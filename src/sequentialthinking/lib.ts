@@ -1,3 +1,4 @@
+import process from "process";
 import chalk from 'chalk';
 
 export interface ThoughtData {

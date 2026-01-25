@@ -1,4 +1,5 @@
 import fs from "fs/promises";
+import { Dirent } from "fs";
 import path from "path";
 import os from 'os';
 import { randomBytes } from 'crypto';
@@ -360,7 +361,7 @@ export async function searchFilesWithValidation(
   async function search(currentPath: string) {
     const entries = await fs.readdir(currentPath, { withFileTypes: true });
 
-    for (const entry of entries) {
+    for (const entry of entries as Dirent[]) {
       const fullPath = path.join(currentPath, entry.name);
 
       try {

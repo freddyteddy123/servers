@@ -1,13 +1,31 @@
 import process from "process";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import express from "express";
+import cors from "cors";
 import {
   RootsListChangedNotificationSchema,
   type Root,
+  type CallToolResult,
+  type Resource,
+  type ResourceLink,
+  ElicitResultSchema,
+  type CreateMessageRequest,
+  CreateMessageResultSchema,
+  type GetTaskResult,
+  type Task,
+  type ElicitResult,
 } from "@modelcontextprotocol/sdk/types.js";
+import {
+  InMemoryTaskStore,
+  InMemoryTaskMessageQueue,
+  type CreateTaskResult,
+} from "@modelcontextprotocol/sdk/experimental/tasks/index.js";
+import { completable } from "@modelcontextprotocol/sdk/server/completable.js";
 import { z } from "zod";
 import fs from "fs/promises";
-import { createReadStream, Dirent } from "fs";
+import { createReadStream, Dirent, readFileSync, readdirSync, statSync } from "fs";
 import path from "path";
 import os from 'os';
 import { fileURLToPath } from 'url';
@@ -17,6 +35,7 @@ import { createTwoFilesPatch } from 'diff';
 import { minimatch } from 'minimatch';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { gzipSync } from "node:zlib";
 
 const execAsync = promisify(exec);
 
@@ -521,15 +540,41 @@ function formatSize(bytes: number): string {
 }
 
 // --- Main Server Initialization ---
-const server = new McpServer({
-  name: "consolidated-mcp-server",
-  version: "1.0.0",
-});
+function createMcpServer() {
+  const taskStore = new InMemoryTaskStore();
+  const taskMessageQueue = new InMemoryTaskMessageQueue();
 
-// Initialize Managers
-const memoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.jsonl');
-const knowledgeGraphManager = new KnowledgeGraphManager(memoryPath);
-const thinkingServer = new SequentialThinkingServer();
+  const server = new McpServer(
+    {
+      name: "consolidated-mcp-server",
+      version: "1.0.0",
+    },
+    {
+      capabilities: {
+        tools: { listChanged: true },
+        prompts: { listChanged: true },
+        resources: { subscribe: true, listChanged: true },
+        logging: {},
+        tasks: {
+          list: {},
+          cancel: {},
+          requests: { tools: { call: {} } },
+        },
+      },
+      taskStore,
+      taskMessageQueue,
+    }
+  );
+
+  // Initialize Managers
+  const memoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.jsonl');
+  const knowledgeGraphManager = new KnowledgeGraphManager(memoryPath);
+  const thinkingServer = new SequentialThinkingServer();
+
+  return { server, knowledgeGraphManager, thinkingServer, taskStore };
+}
+
+const { server, knowledgeGraphManager, thinkingServer, taskStore } = createMcpServer();
 
 // Register Memory Tools
 const EntitySchema = z.object({
@@ -832,9 +877,549 @@ server.registerTool("git_log", { inputSchema: z.object({ repo_path: z.string(), 
   }
 });
 
+// --- Everything Logic ---
+const logsUpdateIntervals = new Map<string | undefined, NodeJS.Timeout>();
+const loggingClients = new Set<string | undefined>();
+const subscriberClients = new Set<string | undefined>();
+const subscriberIntervals = new Map<string | undefined, NodeJS.Timeout>();
+
+const RESOURCE_TYPE_TEXT = "Text" as const;
+const RESOURCE_TYPE_BLOB = "Blob" as const;
+const RESOURCE_TYPES = [RESOURCE_TYPE_TEXT, RESOURCE_TYPE_BLOB];
+
+const textUriBase = "demo://resource/dynamic/text";
+const blobUriBase = "demo://resource/dynamic/blob";
+
+const textResourceUri = (resourceId: number) => new URL(`${textUriBase}/${resourceId}`);
+const blobResourceUri = (resourceId: number) => new URL(`${blobUriBase}/${resourceId}`);
+
+const textResource = (uri: URL, resourceId: number) => ({
+  uri: uri.toString(),
+  mimeType: "text/plain",
+  text: `Resource ${resourceId}: This is a plaintext resource created at ${new Date().toLocaleTimeString()}`,
+});
+
+const blobResource = (uri: URL, resourceId: number) => ({
+  uri: uri.toString(),
+  mimeType: "text/plain",
+  blob: Buffer.from(`Resource ${resourceId}: This is a base64 blob created at ${new Date().toLocaleTimeString()}`).toString("base64"),
+});
+
+const sessionResources = new Map<string, { type: "text" | "blob"; payload: string; resource: Resource }>();
+
+// --- Research Task Logic ---
+const STAGES = ["Gathering sources", "Analyzing content", "Synthesizing findings", "Generating report"];
+const STAGE_DURATION = 1000;
+interface ResearchState {
+  topic: string;
+  ambiguous: boolean;
+  currentStage: number;
+  clarification?: string;
+  completed: boolean;
+  result?: CallToolResult;
+}
+const researchStates = new Map<string, ResearchState>();
+
+function getInterpretationsForTopic(topic: string): Array<{ const: string; title: string }> {
+  const lowerTopic = topic.toLowerCase();
+  if (lowerTopic.includes("python")) {
+    return [
+      { const: "programming", title: "Python programming language" },
+      { const: "snake", title: "Python snake species" },
+      { const: "comedy", title: "Monty Python comedy group" },
+    ];
+  }
+  return [
+    { const: "technical", title: "Technical/scientific perspective" },
+    { const: "historical", title: "Historical perspective" },
+    { const: "current", title: "Current events/news perspective" },
+  ];
+}
+
+function generateResearchReport(state: ResearchState): CallToolResult {
+  const topic = state.clarification ? `${state.topic} (${state.clarification})` : state.topic;
+  const report = `# Research Report: ${topic}\n\n## Research Parameters\n- **Topic**: ${state.topic}\n${state.clarification ? `- **Clarification**: ${state.clarification}` : ""}\n\n## Synthesis\nThis research query was processed through ${STAGES.length} stages:\n${STAGES.map((s, i) => `- Stage ${i + 1}: ${s} ✓`).join("\n")}\n\n---\n\n## About This Demo (SEP-1686: Tasks)\n\nThis tool demonstrates MCP's task-based execution pattern for long-running operations.\n`;
+  return { content: [{ type: "text", text: report }] };
+}
+
+async function runResearchProcess(taskId: string, args: any, taskStore: any, sendRequest: any): Promise<void> {
+  const state = researchStates.get(taskId);
+  if (!state) return;
+  for (let i = state.currentStage; i < STAGES.length; i++) {
+    state.currentStage = i;
+    if (state.completed) return;
+    await taskStore.updateTaskStatus(taskId, "working", `${STAGES[i]}...`);
+    if (i === 2 && state.ambiguous && !state.clarification) {
+      await taskStore.updateTaskStatus(taskId, "input_required", `Found multiple interpretations for "${state.topic}". Requesting clarification...`);
+      try {
+        const elicitResult: ElicitResult = await sendRequest({
+          method: "elicitation/create",
+          params: {
+            message: `The research query "${state.topic}" could have multiple interpretations. Please clarify what you're looking for:`,
+            requestedSchema: {
+              type: "object",
+              properties: {
+                interpretation: {
+                  type: "string",
+                  title: "Clarification",
+                  description: "Which interpretation of the topic do you mean?",
+                  oneOf: getInterpretationsForTopic(state.topic),
+                },
+              },
+              required: ["interpretation"],
+            },
+          },
+        }, ElicitResultSchema);
+        if (elicitResult.action === "accept" && elicitResult.content) {
+          state.clarification = (elicitResult.content as any).interpretation || "User accepted without selection";
+        } else {
+          state.clarification = "User declined/cancelled - using default interpretation";
+        }
+      } catch (error) {
+        state.clarification = "technical (default - elicitation unavailable)";
+      }
+      await taskStore.updateTaskStatus(taskId, "working", `Continuing with interpretation: "${state.clarification}"...`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, STAGE_DURATION));
+  }
+  state.completed = true;
+  const result = generateResearchReport(state);
+  state.result = result;
+  await taskStore.storeTaskResult(taskId, "completed", result);
+}
+
+function getSessionResourceURI(name: string): string {
+  return `demo://resource/session/${name}`;
+}
+
+function registerSessionResource(server: McpServer, resource: Resource, type: "text" | "blob", payload: string): ResourceLink {
+  sessionResources.set(resource.uri, { type, payload, resource });
+  server.registerResource(resource.name, resource.uri, { mimeType: resource.mimeType, description: resource.description }, async (uri) => {
+    const entry = sessionResources.get(uri.toString());
+    if (!entry) throw new Error(`Resource not found: ${uri}`);
+    return {
+      contents: [
+        entry.type === "text"
+          ? { uri: uri.toString(), mimeType: entry.resource.mimeType, text: entry.payload }
+          : { uri: uri.toString(), mimeType: entry.resource.mimeType, blob: entry.payload },
+      ],
+    };
+  });
+  return { type: "resource_link", ...resource };
+}
+
 // --- Everything Tools ---
 server.registerTool("echo", { inputSchema: z.object({ message: z.string() }) }, async (args: any) => {
   return { content: [{ type: "text", text: `Echo: ${args.message}` }] };
+});
+
+server.registerTool("get_env", { inputSchema: z.object({}) }, async () => {
+  return {
+    content: [{ type: "text", text: JSON.stringify(process.env, null, 2) }]
+  };
+});
+
+server.registerTool("get_sum", {
+  inputSchema: z.object({
+    a: z.number().describe("First number"),
+    b: z.number().describe("Second number")
+  })
+}, async (args: any) => {
+  const sum = args.a + args.b;
+  return {
+    content: [{ type: "text", text: `The sum of ${args.a} and ${args.b} is ${sum}.` }]
+  };
+});
+
+server.registerTool("get_structured_content", {
+  inputSchema: z.object({
+    location: z.enum(["New York", "Chicago", "Los Angeles"]).describe("Choose city")
+  })
+}, async (args: any) => {
+  let weather;
+  switch (args.location) {
+    case "New York": weather = { temperature: 33, conditions: "Cloudy", humidity: 82 }; break;
+    case "Chicago": weather = { temperature: 36, conditions: "Light rain / drizzle", humidity: 82 }; break;
+    case "Los Angeles": weather = { temperature: 73, conditions: "Sunny / Clear", humidity: 48 }; break;
+  }
+  return {
+    content: [{ type: "text", text: JSON.stringify(weather) }],
+    structuredContent: weather
+  };
+});
+
+server.registerTool("get_resource_links", {
+  inputSchema: z.object({
+    count: z.number().min(1).max(10).default(3).describe("Number of resource links to return (1-10)"),
+  })
+}, async (args: any) => {
+  const { count } = args;
+  const content: any[] = [{ type: "text", text: `Here are ${count} resource links to resources available in this server:` }];
+  for (let i = 1; i <= count; i++) {
+    const isOdd = i % 2 !== 0;
+    const uri = isOdd ? textResourceUri(i) : blobResourceUri(i);
+    const res = isOdd ? textResource(uri, i) : blobResource(uri, i);
+    content.push({
+      type: "resource_link",
+      uri: res.uri,
+      name: `${isOdd ? "Text" : "Blob"} Resource ${i}`,
+      description: `Resource ${i}: ${isOdd ? "plaintext resource" : "binary blob resource"}`,
+      mimeType: res.mimeType,
+    });
+  }
+  return { content };
+});
+
+server.registerTool("get_resource_reference", {
+  inputSchema: z.object({
+    resourceType: z.enum([RESOURCE_TYPE_TEXT, RESOURCE_TYPE_BLOB]).default(RESOURCE_TYPE_TEXT),
+    resourceId: z.number().default(1).describe("ID of the resource to fetch"),
+  })
+}, async (args: any) => {
+  const { resourceType, resourceId } = args;
+  const uri = resourceType === RESOURCE_TYPE_TEXT ? textResourceUri(resourceId) : blobResourceUri(resourceId);
+  const res = resourceType === RESOURCE_TYPE_TEXT ? textResource(uri, resourceId) : blobResource(uri, resourceId);
+  return {
+    content: [
+      { type: "text", text: `Returning resource reference for Resource ${resourceId}:` },
+      { type: "resource", resource: res },
+      { type: "text", text: `You can access this resource using the URI: ${res.uri}` },
+    ],
+  };
+});
+
+server.registerTool("gzip_file_as_resource", {
+  inputSchema: z.object({
+    name: z.string().describe("Name of the output file").default("README.md.gz"),
+    data: z.string().url().describe("URL or data URI of the file content to compress").default("https://raw.githubusercontent.com/modelcontextprotocol/servers/refs/heads/main/README.md"),
+    outputType: z.enum(["resourceLink", "resource"]).default("resourceLink"),
+  })
+}, async (args: any) => {
+  const { name, data, outputType } = args;
+  const response = await fetch(data);
+  const buffer = await response.arrayBuffer();
+  const compressed = gzipSync(Buffer.from(buffer));
+  const uri = getSessionResourceURI(name);
+  const blob = compressed.toString("base64");
+  const mimeType = "application/gzip";
+  const resource = { uri, name, mimeType };
+  const resourceLink = registerSessionResource(server, resource, "blob", blob);
+  if (outputType === "resource") {
+    return { content: [{ type: "resource", resource: { uri, mimeType, blob } }] };
+  }
+  return { content: [resourceLink] };
+});
+
+server.registerTool("toggle_subscriber_updates", { inputSchema: z.object({}) }, async (_args, extra) => {
+  const sessionId = extra?.sessionId;
+  if (subscriberClients.has(sessionId)) {
+    const interval = subscriberIntervals.get(sessionId);
+    if (interval) clearInterval(interval);
+    subscriberIntervals.delete(sessionId);
+    subscriberClients.delete(sessionId);
+    return { content: [{ type: "text", text: `Stopped simulated resource updates for session ${sessionId}` }] };
+  } else {
+    subscriberClients.add(sessionId);
+    const sendUpdate = async () => {
+      // In a real implementation, we would send notifications for subscribed resources
+      // For this consolidated server, we'll just log that we would send updates
+      console.error(`Simulated resource update for session ${sessionId}`);
+    };
+    sendUpdate();
+    subscriberIntervals.set(sessionId, setInterval(sendUpdate, 5000));
+    return { content: [{ type: "text", text: `Started simulated resource updates for session ${sessionId}` }] };
+  }
+});
+
+server.registerTool("trigger_elicitation_request", { inputSchema: z.object({}) }, async (_args, extra) => {
+  const result = await extra.sendRequest({
+    method: "elicitation/create",
+    params: {
+      message: "Please provide your name:",
+      requestedSchema: {
+        type: "object",
+        properties: { name: { type: "string", title: "Name" } },
+        required: ["name"],
+      },
+    },
+  }, ElicitResultSchema);
+  return { content: [{ type: "text", text: `Elicitation result: ${JSON.stringify(result, null, 2)}` }] };
+});
+
+server.registerTool("trigger_sampling_request", {
+  inputSchema: z.object({
+    prompt: z.string(),
+    maxTokens: z.number().default(100),
+  })
+}, async (args, extra) => {
+  const result = await extra.sendRequest({
+    method: "sampling/createMessage",
+    params: {
+      messages: [{ role: "user", content: { type: "text", text: args.prompt } }],
+      maxTokens: args.maxTokens,
+    },
+  }, CreateMessageResultSchema);
+  return { content: [{ type: "text", text: `Sampling result: ${JSON.stringify(result, null, 2)}` }] };
+});
+
+server.experimental.tasks.registerToolTask("simulate-research-query", {
+  title: "Simulate Research Query",
+  description: "Simulates a deep research operation.",
+  inputSchema: z.object({
+    topic: z.string(),
+    ambiguous: z.boolean().default(false),
+  }),
+  execution: { taskSupport: "required" },
+}, {
+  createTask: async (args: any, extra) => {
+    const task = await extra.taskStore.createTask({ ttl: 300000, pollInterval: 1000 });
+    const state: ResearchState = { topic: args.topic, ambiguous: args.ambiguous, currentStage: 0, completed: false };
+    researchStates.set(task.taskId, state);
+    runResearchProcess(task.taskId, args, extra.taskStore, extra.sendRequest).catch(console.error);
+    return { task };
+  },
+  getTask: async (_args, extra) => extra.taskStore.getTask(extra.taskId),
+  getTaskResult: async (_args, extra) => {
+    const result = await extra.taskStore.getTaskResult(extra.taskId);
+    researchStates.delete(extra.taskId);
+    return result as CallToolResult;
+  },
+});
+
+// --- Everything Prompts ---
+server.registerPrompt("simple-prompt", {
+  title: "Simple Prompt",
+  description: "A prompt with no arguments",
+}, () => ({
+  messages: [{
+    role: "user",
+    content: { type: "text", text: "This is a simple prompt without arguments." },
+  }],
+}));
+
+server.registerPrompt("args-prompt", {
+  title: "Arguments Prompt",
+  description: "A prompt with two arguments, one required and one optional",
+  argsSchema: {
+    city: z.string().describe("Name of the city"),
+    state: z.string().describe("Name of the state").optional(),
+  },
+}, (args) => {
+  const location = `${args?.city}${args?.state ? `, ${args?.state}` : ""}`;
+  return {
+    messages: [{
+      role: "user",
+      content: { type: "text", text: `What's weather in ${location}?` },
+    }],
+  };
+});
+
+server.registerPrompt("completable-prompt", {
+  title: "Team Management",
+  description: "First argument choice narrows values for second argument.",
+  argsSchema: {
+    department: completable(z.string().describe("Choose the department."), (value) => {
+      return ["Engineering", "Sales", "Marketing", "Support"].filter((d) => d.startsWith(value));
+    }),
+    name: completable(z.string().describe("Choose a team member to lead the selected department."), (value, context) => {
+      const department = context?.arguments?.["department"];
+      if (department === "Engineering") return ["Alice", "Bob", "Charlie"].filter((n) => n.startsWith(value));
+      if (department === "Sales") return ["David", "Eve", "Frank"].filter((n) => n.startsWith(value));
+      if (department === "Marketing") return ["Grace", "Henry", "Iris"].filter((n) => n.startsWith(value));
+      if (department === "Support") return ["John", "Kim", "Lee"].filter((n) => n.startsWith(value));
+      return [];
+    }),
+  },
+}, ({ department, name }) => ({
+  messages: [{
+    role: "user",
+    content: { type: "text", text: `Please promote ${name} to the head of the ${department} team.` },
+  }],
+}));
+
+server.registerPrompt("resource-prompt", {
+  title: "Resource Prompt",
+  description: "A prompt that includes an embedded resource reference",
+  argsSchema: {
+    resourceType: completable(z.string().describe("Type of resource to fetch"), (value) => {
+      return RESOURCE_TYPES.filter((t) => t.startsWith(value));
+    }),
+    resourceId: completable(z.string().describe("ID of the text resource to fetch"), (value) => {
+      const id = Number(value);
+      return Number.isInteger(id) && id > 0 ? [value] : [];
+    }),
+  },
+}, (args) => {
+  const resourceType = args.resourceType as typeof RESOURCE_TYPE_TEXT | typeof RESOURCE_TYPE_BLOB;
+  const resourceId = Number(args.resourceId);
+  if (!RESOURCE_TYPES.includes(resourceType)) throw new Error(`Invalid resourceType: ${resourceType}`);
+  if (!Number.isFinite(resourceId) || !Number.isInteger(resourceId) || resourceId < 1) throw new Error(`Invalid resourceId: ${resourceId}`);
+  const uri = resourceType === RESOURCE_TYPE_TEXT ? textResourceUri(resourceId) : blobResourceUri(resourceId);
+  const res = resourceType === RESOURCE_TYPE_TEXT ? textResource(uri, resourceId) : blobResource(uri, resourceId);
+  return {
+    messages: [
+      { role: "user", content: { type: "text", text: `This prompt includes the ${resourceType} resource with id: ${resourceId}. Please analyze the following resource:` } },
+      { role: "user", content: { type: "resource", resource: res } },
+    ],
+  };
+});
+
+const MCP_TINY_IMAGE = "iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAYAAACNiR0NAAAKsGlDQ1BJQ0MgUHJvZmlsZQAASImVlwdUU+kSgOfe9JDQEiIgJfQmSCeAlBBaAAXpYCMkAUKJMRBU7MriClZURLCs6KqIgo0idizYFsWC3QVZBNR1sWDDlXeBQ9jdd9575805c+a7c+efmf+e/z9nLgCdKZDJMlF1gCxpjjwyyI8dn5DIJvUABRiY0kBdIMyWcSMiwgCTUft3+dgGyJC9YzuU69/f/1fREImzhQBIBMbJomxhFsbHMe0TyuQ5ALg9mN9kbo5siK9gzJRjDWL8ZIhTR7hviJOHGY8fjomO5GGsDUCmCQTyVACaKeZn5wpTsTw0f4ztpSKJFGPsGbyzsmaLMMbqgiUWI8N4KD8n+S95Uv+WM1mZUyBIVfLIXoaF7C/JlmUK5v+fn+N/S1amYrSGOaa0NHlwJGaxvpAHGbNDlSxNnhI+yhLRcPwwpymCY0ZZmM1LHGWRwD9UuTZzStgop0gC+co8OfzoURZnB0SNsnx2pLJWipzHHWWBfKyuIiNG6U8T85X589Ki40Y5VxI7ZZSzM6JCx2J4Sr9cEansXywN8hurG6jce1b2X/Yr4SvX5qRFByv3LhjrXyzljuXMjlf2JhL7B4zFxCjjZTl+ylqyzAhlvDgzSOnPzo1Srs3BDuTY2gjlN0wXhESMMoRBELAhBjIhB+QggECQgBTEOeJ5Q2cUeLNl8+WS1LQcNhe7ZWI2Xyq0m8B2tHd0Bhi6syNH4j1r+C4irGtjvhWVAF4nBgcHT475Qm4BHEkCoNaO+SxnAKh3A1w5JVTIc0d8Q9cJCEAFNWCCDhiACViCLTiCK3iCLwRACIRDNCTATBBCGmRhnc+FhbAMCqAI1sNmKIOdsBv2wyE4CvVwCs7DZbgOt+AePIZ26IJX0AcfYQBBEBJCRxiIDmKImCE2iCPCQbyRACQMiUQSkCQkFZEiCmQhsgIpQoqRMmQXUokcQU4g55GrSCvyEOlAepF3yFcUh9JQJqqPmqMTUQ7KRUPRaHQGmorOQfPQfHQtWopWoAfROvQ8eh29h7ajr9B+HOBUcCycEc4Wx8HxcOG4RFwKTo5bjCvEleAqcNW4Rlwz7g6uHfca9wVPxDPwbLwt3hMfjI/BC/Fz8Ivxq/Fl+P34OvxF/B18B74P/51AJ+gRbAgeBD4hnpBKmEsoIJQQ9hJqCZcI9whdhI9EIpFFtCC6EYOJCcR04gLiauJ2Yg3xHLGV2EnsJ5FIOiQbkhcpnCQg5ZAKSFtJB0lnSbdJXaTPZBWyIdmRHEhOJEvJy8kl5APkM+Tb5G7yAEWdYkbxoIRTRJT5lHWUPZRGyk1KF2WAqkG1oHpRo6np1GXUUmo19RL1CfW9ioqKsYq7ylQVicpSlVKVwypXVDpUvtA0adY0Hm06TUFbS9tHO0d7SHtPp9PN6b70RHoOfS29kn6B/oz+WZWhaqfKVxWpLlEtV61Tva36Ro2iZqbGVZuplqdWonZM7abaa3WKurk6T12gvli9XP2E+n31fg2GhoNGuEaWxmqNAxpXNXo0SZrmmgGaIs18zd2aFzQ7GTiGCYPHEDJWMPYwLjG6mESmBZPPTGcWMQ8xW5h9WppazlqxWvO0yrVOa7WzcCxzFp+VyVrHOspqY30dpz+OO048btW46nG3x33SHq/tqy3WLtSu0b6n/VWHrROgk6GzQade56kuXtdad6ruXN0dupd0X49njvccLxxfOP7o+Ed6qJ61XqTeAr3dejf0+vUN9IP0Zfpb9S/ovzZgGfgapBtsMjhj0GvIMPQ2lBhuMjxr+JKtxeayM9ml7IvsPiM9o2AjhdEuoxajAWML4xjj5cY1xk9NqCYckxSTTSZNJn2mhqaTTReaVpk+MqOYcczSzLaYNZt9MrcwjzNfaV5v3mOhbcG3yLOosnhiSbf0sZxjWWF514poxbHKsNpudcsatXaxTrMut75pg9q42khsttu0TiBMcJ8gnVAx4b4tzZZrm2tbZdthx7ILs1tuV2/3ZqLpxMSJGyY2T/xu72Kfab/H/rGDpkOIw3KHRod3jtaOQsdyx7tOdKdApyVODU5vnW2cxc47nB+4MFwmu6x0aXL509XNVe5a7drrZuqW5LbN7T6HyYngrOZccSe4+7kvcT/l/sXD1SPH46jHH562nhmeBzx7JllMEk/aM6nTy9hL4LXLq92b7Z3k/ZN3u4+Rj8Cnwue5r4mvyHevbzfXipvOPch942fvJ/er9fvE8+At4p3zx/kH+Rf6twRoBsQElAU8CwQOTA2sCuwLcglaEHQumBAcGrwh+D5fny/kV/L7QtxCFoVcDKWFRoWWhT4Psw6ThzVORieHTN44+ckUsynSKfXhEM4P3xj+NMIiYk7EyanEqRFTy6e+iHSIXBjZHMWImhV1IOpjtF/0uujHMZYxipimWLXY6bGVsZ/i/OOK49rjJ8Yvir+eoJsgSWhIJCXGJu5N7J8WMG3ztK7pLtMLprfNsJgxb8bVmbozM2eenqU2SzDrWBIhKS7pQNI3QbigQtCfzE/eltwn5Am3CF+JfEWbRL1iL3GxuDvFK6U4pSfVK3Vjam+aT1pJ2msJT1ImeZsenL4z/VNGeMa+jMHMuMyaLHJWUtYJqaY0Q3pxtsHsebNbZTayAln7HI85m+f0yUPle7OR7BnZDTlMbDi6obBU/KDoyPXOLc/9PDd27rF5GvOk827Mt56/an53XmDezwvwC4QLmhYaLVy2sGMRd9Guxcji5MVNS0yW5C/pWhq0dP8y6rKMZb8st19evPzDirgVjfn6+UvzO38I+qGqQLVAXnB/pefKnT/if5T82LLKadXWVd8LRYXXiuyLSoq+rRauvrbGYU3pmsG1KWtb1rmu27GeuF66vm2Dz4b9xRrFecWdGydvrNvE3lS46cPmWZuvljiX7NxC3aLY0l4aVtqw1XTr+q3fytLK7pX7ldds09u2atun7aLtt3f47qjeqb+zaOfXnyQ/PdgVtKuuwryiZDdxd+7uF3ti9zT/zPm5cq/u3qK9f+6T7mvfH7n/YqVbZeUBvQPrqtAqRVXvwekHbx3yP9RQbVu9q4ZVU3QYDisOvzySdKTtaOjRpmOcY9XHzY5vq2XUFtYhdfPr+urT6tsbEhpaT4ScaGr0bKw9aXdy3ymjU+WntU6vO0M9k39m8Gze2f5zsnOvz6ee72ya1fT4QvyFuxenXmy5FHrpyuXAyxeauc1nr3hdOXXV4+qJa5xr9dddr9fdcLlR+4vLL7Utri11N91uNtzyv9XYOqn1zG2f2+fv+N+5fJd/9/q9Kfda22LaHtyffr/9gehBz8PMh28f5T4aeLz0CeFJ4VP1pyXP9J5V/Gr1a027a/vpDv+OG8+jnj/uFHa++i37t29d+S/oL0q6Dbsrexx7TvUG9t56Oe1l1yvZq4HXBb9r/L7tjeWb43/4/nGjL76v66387eC71e913u/74PyhqT+i/9nHrI8Dnwo/63ze/4Xzpflr3NfugbnfSN9K/7T6s/F76Pcng1mDgzKBXDA8CuAwRVNSAN7tA6AnADCwGYI6bWSmHhZk5D9gmOA/8cjcPSyuANWYGRqNeOcADmNqvhRAzRdgaCyK9gXUyUmpo/Pv8Kw+JAbYv8K0HECi2x6tebQU/iEjc/xf+v6nBWXWv9l/AV0EC6JTIblRAAAAeGVYSWZNTQAqAAAACAAFARIAAwAAAAEAAQAAARoABQAAAAEAAABKARsABQAAAAEAAABSASgAAwAAAAEAAgAAh2kABAAAAAEAAABaAAAAAAAAAJAAAAABAAAAkAAAAAEAAqACAAQAAAABAAAAFKADAAQAAAABAAAAFAAAAAAXNii1AAAACXBIWXMAABYlAAAWJQFJUiTwAAAB82lUWHRYTUw6Y29tLmFkb2JlLnhtcAAAAAAAPHg6eG1wbWV0YSB4bWxuczp4PSJhZG9iZTpuczptZXRhLyIgeDp4bXB0az0iWE1QIENvcmUgNi4wLjAiPgogICA8cmRmOlJERiB4bWxuczpyZGY9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkvMDIvMjItcmRmLXN5bnRheC1ucyMiPgogICAgICA8cmRmOkRlc2NyaXB0aW9uIHJkZjphYm91dD0iIgogICAgICAgICAgICB4bWxuczp0aWZmPSJodHRwOi8vbnMuYWRvYmUuY29tL3RpZmYvMS4wLyI+CiAgICAgICAgIDx0aWZmOllSZXNvbHV0aW9uPjE0NDwvdGlmZjpZUmVzb2x1dGlvbj4KICAgICAgICAgPHRpZmY6T3JpZW50YXRpb24+MTwvdGlmZjpOcmllbnRhdGlvbj4KICAgICAgICAgPHRpZmY6WFJlc29sdXRpb24+MTQ0PC90aWZmOlhSZXNvbHV0aW9uPgogICAgICAgICA8dGlmZjpSZXNvbHV0aW9uVW5pdD4yPC90aWZmOlJlc29sdXRpb25Vbml0PgogICAgICA8L3JkZjpEZXNjcmlwdGlvbj4KICAgPC9yZGY6UkRGPgo8L3g6eG1wbWV0YT4KReh49gAAAjRJREFUOBGFlD2vMUEUx2clvoNCcW8hCqFAo1dKhEQpvsF9KrWEBh/ALbQ0KkInBI3SWyGPCCJEQliXgsTLefaca/bBWjvJzs6cOf/fnDkzOQJIjWm06/XKBEGgD8c6nU5VIWgBtQDPZPWtJE8O63a7LBgMMo/Hw0ql0jPjcY4RvmqXy4XMjUYDUwLtdhtmsxnYbDbI5/O0djqdFFKmsEiGZ9jP9gem0yn0ej2Yz+fg9XpfycimAD7DttstQTDKfr8Po9GIIg6Hw1Cr1RTgB+A72GAwgMPhQLBMJgNSXsFqtUI2myUo18pA6QJogefsPrLBX4QdCVatViklw+EQRFGEj88P2O12pEUGATmsXq+TaLPZ0AXgMRF2vMEqlQoJTSYTpNNpApvNZliv1/+BHDaZTAi2Wq1A3Ig0xmMej7+RcZjdbodUKkWAaDQK+GHjHPnImB88JrZIJAKFQgH2+z2BOczhcMiwRCIBgUAA+NN5BP6mj2DYff35gk6nA61WCzBn2XiO5wPM7/fLz4vD0E+OECfn8xl/0Gw2KbLxeAyLxQIsFgt8p75pDSO7h/HbpUWpewCike9WLpfB7XaDy+WCYrFI/slk8i0MnRRAUt46hPMI4vE4+Hw+ec7t9/44VgWigEeby+UgFArJWjUYOqhWG6x50rpcSfR6PVUfNOgEVRlTX0HhrZBKz4MZjUYWi8VoA+lc9H/VaRZYjBKrtXR8tlwumcFgeMWRbZpA9ORQWfVm8A/FsrLaxebd5wAAAABJRU5ErkJggg==";
+
+server.registerTool("get_annotated_message", {
+  inputSchema: z.object({
+    messageType: z.enum(["error", "success", "debug"]).describe("Type of message"),
+    includeImage: z.boolean().default(false).describe("Whether to include an example image")
+  })
+}, async (args: any) => {
+  const content: any[] = [];
+  if (args.messageType === "error") {
+    content.push({ type: "text", text: "Error: Operation failed", annotations: { priority: 1.0, audience: ["user", "assistant"] } });
+  } else if (args.messageType === "success") {
+    content.push({ type: "text", text: "Operation completed successfully", annotations: { priority: 0.7, audience: ["user"] } });
+  } else if (args.messageType === "debug") {
+    content.push({ type: "text", text: "Debug: Cache hit ratio 0.95, latency 150ms", annotations: { priority: 0.3, audience: ["assistant"] } });
+  }
+  if (args.includeImage) {
+    content.push({ type: "image", data: MCP_TINY_IMAGE, mimeType: "image/png", annotations: { priority: 0.5, audience: ["user"] } });
+  }
+  return { content };
+});
+
+server.registerTool("get_tiny_image", { inputSchema: z.object({}) }, async () => {
+  return {
+    content: [
+      { type: "text", text: "Here's the image you requested:" },
+      { type: "image", data: MCP_TINY_IMAGE, mimeType: "image/png" },
+      { type: "text", text: "The image above is the MCP logo." }
+    ]
+  };
+});
+
+server.registerTool("trigger_long_running_operation", {
+  inputSchema: z.object({
+    duration: z.number().default(10).describe("Duration of the operation in seconds"),
+    steps: z.number().default(5).describe("Number of steps in the operation")
+  })
+}, async (args: any, extra: any) => {
+  const { duration, steps } = args;
+  const stepDuration = duration / steps;
+  const progressToken = extra._meta?.progressToken;
+  for (let i = 1; i < steps + 1; i++) {
+    await new Promise((resolve) => setTimeout(resolve, stepDuration * 1000));
+    if (progressToken !== undefined) {
+      await server.server.notification({
+        method: "notifications/progress",
+        params: { progress: i, total: steps, progressToken }
+      }, { relatedRequestId: extra.requestId });
+    }
+  }
+  return {
+    content: [{ type: "text", text: `Long running operation completed. Duration: ${duration} seconds, Steps: ${steps}.` }]
+  };
+});
+
+server.registerTool("toggle_simulated_logging", { inputSchema: z.object({}) }, async (_args, extra) => {
+  const sessionId = extra?.sessionId;
+  if (loggingClients.has(sessionId)) {
+    const interval = logsUpdateIntervals.get(sessionId);
+    if (interval) clearInterval(interval);
+    logsUpdateIntervals.delete(sessionId);
+    loggingClients.delete(sessionId);
+    return { content: [{ type: "text", text: `Stopped simulated logging for session ${sessionId}` }] };
+  } else {
+    loggingClients.add(sessionId);
+    const sendLog = async () => {
+      const levels: any[] = ["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"];
+      const level = levels[Math.floor(Math.random() * levels.length)];
+      await (server as any).sendLoggingMessage({
+        level,
+        data: `Simulated ${level} message for session ${sessionId}`
+      }, sessionId);
+    };
+    sendLog();
+    logsUpdateIntervals.set(sessionId, setInterval(sendLog, 5000));
+    return { content: [{ type: "text", text: `Started simulated logging for session ${sessionId}` }] };
+  }
+});
+
+server.registerTool("get_roots_list", { inputSchema: z.object({}) }, async () => {
+  const clientCapabilities = server.server.getClientCapabilities() || {};
+  if (!clientCapabilities.roots) {
+    return { content: [{ type: "text", text: "Client does not support roots capability." }] };
+  }
+  try {
+    const response = await server.server.listRoots();
+    return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
+  } catch (error) {
+    return { content: [{ type: "text", text: `Error listing roots: ${error}` }] };
+  }
+});
+
+// --- Resources ---
+server.registerResource("example_resource", "memo://example.txt", {
+  mimeType: "text/plain",
+  description: "An example text resource"
+}, async (uri) => {
+  return {
+    contents: [{
+      uri: uri.toString(),
+      mimeType: "text/plain",
+      text: "This is an example resource content from the consolidated server."
+    }]
+  };
+});
+
+server.registerResource(
+  "Dynamic Text Resource",
+  new ResourceTemplate("demo://resource/dynamic/text/{resourceId}", {
+    list: undefined,
+    complete: {
+      resourceId: (value: string) => {
+        const id = Number(value);
+        return Number.isInteger(id) && id > 0 ? [value] : [];
+      }
+    }
+  }),
+  {
+    mimeType: "text/plain",
+    description: "Plaintext dynamic resource fabricated from the {resourceId} variable.",
+  },
+  async (uri, variables) => {
+    const resourceId = Number(variables.resourceId);
+    return {
+      contents: [textResource(new URL(uri.toString()), resourceId)],
+    };
+  }
+);
+
+server.registerResource(
+  "Dynamic Blob Resource",
+  new ResourceTemplate("demo://resource/dynamic/blob/{resourceId}", {
+    list: undefined,
+    complete: {
+      resourceId: (value: string) => {
+        const id = Number(value);
+        return Number.isInteger(id) && id > 0 ? [value] : [];
+      }
+    }
+  }),
+  {
+    mimeType: "application/octet-stream",
+    description: "Binary dynamic resource fabricated from the {resourceId} variable.",
+  },
+  async (uri, variables) => {
+    const resourceId = Number(variables.resourceId);
+    return {
+      contents: [blobResource(new URL(uri.toString()), resourceId)],
+    };
+  }
+);
+
+server.registerTool("list_resources", { inputSchema: z.object({}) }, async () => {
+  // @ts-ignore - listResources exists on the internal server but might not be in types
+  const resources = await (server as any).server.listResources();
+  return { content: [{ type: "text", text: JSON.stringify(resources, null, 2) }] };
 });
 
 // --- Roots Protocol Support ---
@@ -883,7 +1468,10 @@ server.server.oninitialized = async () => {
 
 async function main() {
   const args = process.argv.slice(2);
-  const initialAllowedDirs = await Promise.all(args.map(async (dir) => {
+  const transportType = args[0] === "sse" ? "sse" : "stdio";
+  const initialDirs = transportType === "sse" ? args.slice(1) : args;
+
+  const initialAllowedDirs = await Promise.all(initialDirs.map(async (dir) => {
     const expanded = expandHome(dir);
     const absolute = path.resolve(expanded);
     try {
@@ -895,9 +1483,66 @@ async function main() {
   }));
   setAllowedDirectories(initialAllowedDirs);
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("Consolidated MCP Server running on stdio");
+  // Register static file resources from docs
+  const docsDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'everything', 'docs');
+  try {
+    const entries = readdirSync(docsDir);
+    for (const name of entries) {
+      const fullPath = path.join(docsDir, name);
+      const st = statSync(fullPath);
+      if (!st.isFile()) continue;
+      const uri = `demo://resource/static/document/${encodeURIComponent(name)}`;
+      const mimeType = name.endsWith(".md") ? "text/markdown" : name.endsWith(".json") ? "application/json" : "text/plain";
+      server.registerResource(name, uri, { mimeType, description: `Static document: ${name}` }, async (uri) => {
+        return { contents: [{ uri: uri.toString(), mimeType, text: readFileSync(fullPath, "utf-8") }] };
+      });
+    }
+  } catch (e) {
+    console.error("Failed to register static resources:", e);
+  }
+
+  if (transportType === "stdio") {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error("Consolidated MCP Server running on stdio");
+  } else {
+    const app = express();
+    app.use(cors());
+    const transports = new Map<string, SSEServerTransport>();
+
+    app.get("/sse", async (_req, res) => {
+      const transport = new SSEServerTransport("/message", res);
+      transports.set(transport.sessionId, transport);
+      await server.connect(transport);
+      console.error(`Client connected: ${transport.sessionId}`);
+      server.server.onclose = async () => {
+        transports.delete(transport.sessionId);
+        console.error(`Client disconnected: ${transport.sessionId}`);
+      };
+    });
+
+    app.post("/message", async (req, res) => {
+      const sessionId = req.query.sessionId as string;
+      const transport = transports.get(sessionId);
+      if (transport) await transport.handlePostMessage(req, res);
+      else res.status(404).send("Session not found");
+    });
+
+    const PORT = process.env.PORT || 3001;
+    app.listen(PORT, () => {
+      console.error(`Consolidated MCP Server running on SSE at http://localhost:${PORT}/sse`);
+    });
+  }
+
+  // Cleanup on exit
+  const cleanup = () => {
+    for (const interval of logsUpdateIntervals.values()) clearInterval(interval);
+    for (const interval of subscriberIntervals.values()) clearInterval(interval);
+    taskStore.cleanup();
+  };
+
+  process.on('SIGINT', cleanup);
+  process.on('SIGTERM', cleanup);
 }
 
 main().catch((error) => {

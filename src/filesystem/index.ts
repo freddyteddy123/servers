@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import process from "process";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -8,7 +9,7 @@ import {
   type Root,
 } from "@modelcontextprotocol/sdk/types.js";
 import fs from "fs/promises";
-import { createReadStream } from "fs";
+import { createReadStream, Dirent } from "fs";
 import path from "path";
 import { z } from "zod";
 import { minimatch } from "minimatch";
@@ -417,7 +418,7 @@ server.registerTool(
     const validPath = await validatePath(args.path);
     const entries = await fs.readdir(validPath, { withFileTypes: true });
     const formatted = entries
-      .map((entry) => `${entry.isDirectory() ? "[DIR]" : "[FILE]"} ${entry.name}`)
+      .map((entry: Dirent) => `${entry.isDirectory() ? "[DIR]" : "[FILE]"} ${entry.name}`)
       .join("\n");
     return {
       content: [{ type: "text" as const, text: formatted }],
@@ -448,7 +449,7 @@ server.registerTool(
 
     // Get detailed information for each entry
     const detailedEntries = await Promise.all(
-      entries.map(async (entry) => {
+      entries.map(async (entry: Dirent) => {
         const entryPath = path.join(validPath, entry.name);
         try {
           const stats = await fs.stat(entryPath);
